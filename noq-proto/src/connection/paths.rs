@@ -162,6 +162,8 @@ pub(super) struct SentChallengeInfo {
 pub(super) struct PathData {
     pub(super) network_path: FourTuple,
     pub(super) rtt: RttEstimator,
+    /// RTT samples whose outbound and return packets both used this path.
+    pub(super) same_path_rtt: Option<RttEstimator>,
     /// Whether we're enabling ECN on outgoing packets
     pub(super) sending_ecn: bool,
     /// Congestion controller state
@@ -302,6 +304,7 @@ impl PathData {
         Self {
             network_path,
             rtt: RttEstimator::new(config.initial_rtt),
+            same_path_rtt: None,
             sending_ecn: true,
             pacing: Pacer::new(
                 config.initial_rtt,
@@ -364,6 +367,7 @@ impl PathData {
         Self {
             network_path,
             rtt: prev.rtt,
+            same_path_rtt: None,
             pacing: Pacer::new(
                 smoothed_rtt,
                 congestion.window(),

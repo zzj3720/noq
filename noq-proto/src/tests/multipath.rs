@@ -93,6 +93,76 @@ fn path_acks() {
 }
 
 #[test]
+fn acknowledgement_returns_on_the_path_that_carried_the_packet() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder().enable_multipath().connect();
+    let server_addr = pair.routes.public_server_addr();
+    let path = pair.open_path(
+        Client,
+        FourTuple::from_remote(server_addr),
+        PathStatus::Available,
+    )?;
+    pair.drive();
+
+    // The client sends application data on path 1; the server prefers path 0 for its own data.
+    pair.set_path_status(Client, PathId::ZERO, PathStatus::Backup)?;
+    pair.set_path_status(Server, path, PathStatus::Backup)?;
+    pair.drive();
+    let before = pair.path_stats(Server, path).unwrap().frame_tx.path_acks;
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream).write(b"hello").unwrap();
+    pair.drive();
+
+    let after = pair.path_stats(Server, path).unwrap().frame_tx.path_acks;
+    assert!(
+        after > before,
+        "the server did not return an acknowledgement on the incoming path"
+    );
+    assert!(
+        pair.path_stats(Client, path)
+            .unwrap()
+            .same_path_rtt
+            .is_some()
+    );
+    Ok(())
+}
+
+#[test]
+fn old_peer_cross_path_ack_does_not_masquerade_as_path_rtt() -> TestResult {
+    let _guard = subscribe();
+    let mut builder = ConnPair::builder()
+        .enable_multipath()
+        .with_latency(Duration::from_millis(10));
+    builder.server_transport_cfg.legacy_cross_path_acks = true;
+    let mut pair = builder.connect();
+    let server_addr = pair.routes.public_server_addr();
+    let path = pair.open_path(
+        Client,
+        FourTuple::from_remote(server_addr),
+        PathStatus::Available,
+    )?;
+    pair.drive();
+    pair.set_path_status(Client, PathId::ZERO, PathStatus::Backup)?;
+    pair.set_path_status(Server, path, PathStatus::Backup)?;
+    pair.drive();
+    let recovery_before = pair.path_stats(Client, path).unwrap().rtt;
+    pair.routes.set_latency(Duration::from_millis(200));
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream).write(b"hello").unwrap();
+    pair.drive();
+    let after = pair.path_stats(Client, path).unwrap();
+    assert_ne!(
+        after.rtt, recovery_before,
+        "recovery still uses the acknowledgement"
+    );
+    assert_eq!(
+        after.same_path_rtt, None,
+        "a cross-path ACK is not a same-path measurement"
+    );
+    Ok(())
+}
+
+#[test]
 fn path_status() -> TestResult {
     let _guard = subscribe();
     let mut pair = ConnPair::builder().enable_multipath().connect();

@@ -1502,9 +1502,13 @@ impl Connection {
                 } else if can_send.close && scheduling_info.may_send_close {
                     // This is the best path to send a CONNECTION_CLOSE on.
                     true
-                } else if needs_loss_probe || can_send.space_specific {
+                } else if needs_loss_probe
+                    || can_send.space_specific
+                    || (can_send.acks && (self.same_path_acks() || scheduling_info.may_send_data))
+                {
                     // We always send a loss probe or space-specific frames if the path is
-                    // not abandoned.
+                    // not abandoned. ACKs also go on the path being acknowledged, even if
+                    // it is a backup, so they can measure that path's round trip.
                     true
                 } else {
                     // Anything else we only send if we're the best path for SpaceKind::Data
@@ -2190,6 +2194,17 @@ impl Connection {
     /// *packet_size* is the number of bytes available to build the next packet.
     /// *connection_close_pending* indicates whether a CONNECTION_CLOSE frame needs to be
     /// sent.
+    fn same_path_acks(&self) -> bool {
+        #[cfg(test)]
+        {
+            !self.config.legacy_cross_path_acks
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    }
+
     fn space_can_send(
         &mut self,
         space_id: SpaceId,
@@ -2197,6 +2212,10 @@ impl Connection {
         packet_size: usize,
         connection_close_pending: bool,
     ) -> SendableFrames {
+        let multipath =
+            self.same_path_acks() && self.is_multipath_negotiated() && space_id == SpaceId::Data;
+        let may_send_fallback_acks = self.scheduling_info(path_id).may_send_data;
+        let abandoned_paths = &self.abandoned_paths;
         let space = &mut self.spaces[space_id];
         let space_has_crypto = self.crypto_state.has_keys(space_id.encryption_level());
 
@@ -2210,6 +2229,13 @@ impl Connection {
         }
 
         let mut can_send = space.can_send(path_id, &self.streams);
+        if multipath {
+            can_send.acks = space.number_spaces.iter().any(|(&ack_path, pns)| {
+                (ack_path == path_id
+                    || (may_send_fallback_acks && abandoned_paths.contains(&ack_path)))
+                    && pns.pending_acks.can_send()
+            });
+        }
 
         // Check for 1RTT space.
         if space_id == SpaceId::Data {
@@ -2686,6 +2712,7 @@ impl Connection {
         let path = self.paths.get(&path_id)?;
         let mut stats = self.path_stats.get(path_id).unwrap_or_default();
         stats.rtt = path.data.rtt.get();
+        stats.same_path_rtt = path.data.same_path_rtt.map(|rtt| rtt.get());
         stats.cwnd = path.data.congestion.window();
         stats.current_mtu = path.data.mtud.current_mtu();
         Some(stats)
@@ -2907,21 +2934,23 @@ impl Connection {
         &mut self,
         now: Instant,
         space: SpaceId,
+        received_path: PathId,
         ack: frame::Ack,
     ) -> Result<(), TransportError> {
         // All ACKs are referencing path 0
         let path = PathId::ZERO;
-        self.inner_on_ack_received(now, space, path, ack)
+        self.inner_on_ack_received(now, space, path, received_path, ack)
     }
 
     fn on_path_ack_received(
         &mut self,
         now: Instant,
         space: SpaceId,
+        received_path: PathId,
         path_ack: frame::PathAck,
     ) -> Result<(), TransportError> {
         let (ack, path) = path_ack.into_ack();
-        self.inner_on_ack_received(now, space, path, ack)
+        self.inner_on_ack_received(now, space, path, received_path, ack)
     }
 
     /// Handles an ACK frame acknowledging packets sent on *path*.
@@ -2930,6 +2959,7 @@ impl Connection {
         now: Instant,
         space: SpaceId,
         path: PathId,
+        received_path: PathId,
         ack: frame::Ack,
     ) -> Result<(), TransportError> {
         if !self.spaces[space].number_spaces.contains_key(&path) {
@@ -2950,6 +2980,9 @@ impl Connection {
         if ack.largest >= self.spaces[space].for_path(path).next_packet_number {
             return Err(TransportError::PROTOCOL_VIOLATION("unsent packet acked"));
         }
+        // Only samples sent in this path generation describe the current 4-tuple.
+        let generation = self.path_data(path).generation();
+        let mut current_generation_sample = false;
         // `Some(pn)` if this ACK raised `largest_acked_packet_pn`.
         let new_largest_pn = {
             let space = &mut self.spaces[space].for_path(path);
@@ -2963,6 +2996,7 @@ impl Connection {
                     // haven't sent. At worst, that will result in us spuriously reducing the
                     // congestion window.
                     space.largest_acked_packet_send_time = info.time_sent;
+                    current_generation_sample = info.path_generation == generation;
                 }
                 Some(ack.largest)
             } else {
@@ -3054,6 +3088,15 @@ impl Connection {
             let path_data = self.path_data_mut(path);
             // TODO(@divma): should be a method of path, should be contained in a single place
             path_data.rtt.update(ack_delay, rtt);
+            if path == received_path && current_generation_sample {
+                path_data
+                    .same_path_rtt
+                    .get_or_insert_with(|| paths::RttEstimator::new(rtt))
+                    .update(ack_delay, rtt);
+            } else {
+                // The recovery estimate includes both paths, so it cannot describe either one.
+                path_data.same_path_rtt = None;
+            }
             if path_data.first_packet_after_rtt_sample.is_none() {
                 path_data.first_packet_after_rtt_sample = Some((space.kind(), next_pn));
             }
@@ -4869,12 +4912,12 @@ impl Connection {
                     self.read_crypto(packet.header.space().into(), &frame, payload_len)?;
                 }
                 Frame::Ack(ack) => {
-                    self.on_ack_received(now, packet.header.space().into(), ack)?;
+                    self.on_ack_received(now, packet.header.space().into(), path_id, ack)?;
                 }
                 Frame::PathAck(ack) => {
                     span.as_ref()
                         .map(|span| span.record("path", tracing::field::display(&ack.path_id)));
-                    self.on_path_ack_received(now, packet.header.space().into(), ack)?;
+                    self.on_path_ack_received(now, packet.header.space().into(), path_id, ack)?;
                 }
                 Frame::Close(reason) => {
                     self.state
@@ -4987,7 +5030,7 @@ impl Connection {
                     }
                 }
                 Frame::Ack(ack) => {
-                    self.on_ack_received(now, SpaceId::Data, ack)?;
+                    self.on_ack_received(now, SpaceId::Data, path_id, ack)?;
                 }
                 Frame::PathAck(ack) => {
                     if !self.is_multipath_negotiated() {
@@ -4996,7 +5039,7 @@ impl Connection {
                         ));
                     }
                     span.record("path", tracing::field::display(&ack.path_id));
-                    self.on_path_ack_received(now, SpaceId::Data, ack)?;
+                    self.on_path_ack_received(now, SpaceId::Data, path_id, ack)?;
                 }
                 Frame::Padding | Frame::Ping => {}
                 Frame::Close(reason) => {
@@ -6086,6 +6129,7 @@ impl Connection {
         builder: &mut PacketBuilder<'a, 'b>,
     ) {
         let is_multipath_negotiated = self.is_multipath_negotiated();
+        let same_path_acks = self.same_path_acks();
         let space_has_keys = self.crypto_state.has_keys(space_id.encryption_level());
         let is_0rtt = space_id == SpaceId::Data && !space_has_keys;
         let stats = &mut self.path_stats.get_mut(path_id).frame_tx;
@@ -6125,18 +6169,25 @@ impl Connection {
         }
 
         // ACK
-        if !scheduling_info.is_abandoned && scheduling_info.may_send_data {
-            for path_id in space
+        if !scheduling_info.is_abandoned && (same_path_acks || scheduling_info.may_send_data) {
+            for ack_path in space
                 .number_spaces
                 .iter_mut()
-                .filter(|(_, pns)| pns.pending_acks.can_send())
-                .map(|(&path_id, _)| path_id)
+                .filter(|(ack_path, pns)| {
+                    pns.pending_acks.can_send()
+                        && (!same_path_acks
+                            || !is_multipath_negotiated
+                            || **ack_path == path_id
+                            || (scheduling_info.may_send_data
+                                && self.abandoned_paths.contains(ack_path)))
+                })
+                .map(|(&ack_path, _)| ack_path)
                 .collect::<Vec<_>>()
             {
                 Self::populate_acks(
                     now,
                     self.receiving_ecn,
-                    path_id,
+                    ack_path,
                     space_id,
                     space,
                     is_multipath_negotiated,
