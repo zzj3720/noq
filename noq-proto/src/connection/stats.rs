@@ -216,8 +216,10 @@ impl std::fmt::Debug for FrameStats {
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PathStats {
-    /// Current best estimate of this connection's latency (round-trip-time).
+    /// Recovery RTT, which can include an acknowledgement returned over a different path.
     pub rtt: Duration,
+    /// RTT measured on this path in both directions, or none if the latest ACK used another path.
+    pub same_path_rtt: Option<Duration>,
     /// Statistics about datagrams and bytes sent on this path.
     pub udp_tx: UdpStats,
     /// Statistics about datagrams and bytes received on this path.
@@ -283,6 +285,7 @@ impl std::ops::Add<PathStats> for ConnectionStats {
         // rtt, cwnd and current_mtu fields.
         let PathStats {
             rtt: _,
+            same_path_rtt: _,
             udp_tx,
             udp_rx,
             frame_tx,
@@ -316,6 +319,7 @@ impl std::ops::AddAssign<PathStats> for ConnectionStats {
         // rtt, cwnd and current_mtu fields.
         let PathStats {
             rtt: _,
+            same_path_rtt: _,
             udp_tx: path_udp_tx,
             udp_rx: path_udp_rx,
             frame_tx: path_frame_tx,

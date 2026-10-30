@@ -54,6 +54,9 @@ pub struct TransportConfig {
     pub(crate) datagram_send_buffer_size: usize,
     #[cfg(test)]
     pub(crate) deterministic_packet_numbers: bool,
+    /// Simulates a peer from before ACKs were sent on their incoming path.
+    #[cfg(test)]
+    pub(crate) legacy_cross_path_acks: bool,
 
     pub(crate) congestion_controller_factory: Arc<dyn congestion::ControllerFactory + Send + Sync>,
 
@@ -582,6 +585,8 @@ impl Default for TransportConfig {
             datagram_send_buffer_size: 1024 * 1024,
             #[cfg(test)]
             deterministic_packet_numbers: false,
+            #[cfg(test)]
+            legacy_cross_path_acks: false,
 
             congestion_controller_factory: Arc::new(congestion::CubicConfig::default()),
 
@@ -631,6 +636,8 @@ impl fmt::Debug for TransportConfig {
             datagram_send_buffer_size,
             #[cfg(test)]
                 deterministic_packet_numbers: _,
+            #[cfg(test)]
+                legacy_cross_path_acks: _,
             congestion_controller_factory: _,
             enable_segmentation_offload,
             address_discovery_role,
