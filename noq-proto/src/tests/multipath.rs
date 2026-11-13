@@ -163,6 +163,51 @@ fn old_peer_cross_path_ack_does_not_masquerade_as_path_rtt() -> TestResult {
 }
 
 #[test]
+fn same_path_rtt_on_lan_not_inflated_by_ack_delay() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder()
+        .enable_multipath()
+        .with_latency(Duration::from_millis(2))
+        .connect();
+    let server_addr = pair.routes.public_server_addr();
+    let path = pair.open_path(
+        Client,
+        FourTuple::from_remote(server_addr),
+        PathStatus::Backup,
+    )?;
+    pair.drive();
+
+    let client_rtt = pair
+        .path_stats(Client, path)
+        .unwrap()
+        .same_path_rtt
+        .expect("client same_path_rtt should be populated on path establishment");
+    let server_rtt = pair
+        .path_stats(Server, path)
+        .unwrap()
+        .same_path_rtt
+        .expect("server same_path_rtt should be populated on path establishment");
+    assert_eq!(client_rtt, Duration::from_millis(4));
+    assert_eq!(server_rtt, Duration::from_millis(4));
+
+    // Sending a single-packet message on the path should keep same_path_rtt at the true 4ms RTT
+    // rather than inflating it by max_ack_delay (25ms).
+    pair.set_path_status(Client, PathId::ZERO, PathStatus::Backup)?;
+    pair.set_path_status(Client, path, PathStatus::Available)?;
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream).write(b"ping").unwrap();
+    pair.drive();
+
+    let client_rtt_after = pair
+        .path_stats(Client, path)
+        .unwrap()
+        .same_path_rtt
+        .unwrap();
+    assert_eq!(client_rtt_after, Duration::from_millis(4));
+    Ok(())
+}
+
+#[test]
 fn path_status() -> TestResult {
     let _guard = subscribe();
     let mut pair = ConnPair::builder().enable_multipath().connect();
