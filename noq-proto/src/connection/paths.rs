@@ -508,6 +508,7 @@ impl PathData {
         &mut self,
         now: Instant,
         token: u64,
+        received_on: FourTuple,
     ) -> OnPathResponseReceived {
         // > § 8.2.3
         // > Path validation succeeds when a PATH_RESPONSE frame is received that contains the
@@ -518,7 +519,7 @@ impl PathData {
         // At this point we have three potentially different network paths:
         // - current network path (`Self::network_path`)
         // - network path used to send the path challenge (`SentChallengeInfo::network_path`)
-        // - network path over which the response arrived (not needed)
+        // - network path over which the response arrived (`received_on`)
         //
         // As per above spec quote, this only validates the network path on which this was
         // *sent*, regardless of the path on which it was received in order to protect
@@ -543,6 +544,11 @@ impl PathData {
                 // sample: https://www.rfc-editor.org/rfc/rfc9002#section-6.2.2-2.
                 let rtt = now.saturating_duration_since(sent_instant);
                 self.rtt.reset_initial_rtt(rtt);
+                if received_on.is_probably_same_path(&self.network_path) {
+                    self.same_path_rtt
+                        .get_or_insert_with(|| RttEstimator::new(rtt))
+                        .reset_initial_rtt(rtt);
+                }
 
                 OnPathResponseReceived::OnPath
             }
@@ -841,9 +847,15 @@ impl RttEstimator {
             self.var = (3 * self.var + var_sample) / 4;
             self.smoothed = Some((7 * smoothed + adjusted_rtt) / 8);
         } else {
-            self.smoothed = Some(self.latest);
-            self.var = self.latest / 2;
-            self.min = self.latest;
+            let adjusted_rtt = self.latest.saturating_sub(ack_delay);
+            let adjusted_rtt = if adjusted_rtt.is_zero() {
+                self.latest
+            } else {
+                adjusted_rtt
+            };
+            self.smoothed = Some(adjusted_rtt);
+            self.var = adjusted_rtt / 2;
+            self.min = adjusted_rtt;
         }
     }
 }
@@ -877,7 +889,7 @@ impl PathResponses {
         let existing = self
             .pending
             .iter_mut()
-            .find(|x| x.network_path.remote == network_path.remote);
+            .find(|x| x.network_path == network_path);
         if let Some(existing) = existing {
             // Update a queued response
             if existing.packet <= packet {
@@ -1192,6 +1204,8 @@ impl std::ops::BitOrAssign for PathRetransmits {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
     use super::*;
 
     #[test]
@@ -1203,5 +1217,45 @@ mod tests {
 
         // outside range saturates
         assert_eq!(PathId::MAX.saturating_add(1u8), PathId::MAX)
+    }
+
+    #[test]
+    fn test_rtt_estimator_delayed_first_ack() {
+        let mut rtt = RttEstimator::new(Duration::from_millis(333));
+        rtt.reset_initial_rtt(Duration::from_millis(4));
+        assert_eq!(rtt.get(), Duration::from_millis(4));
+        assert_eq!(rtt.min(), Duration::from_millis(4));
+
+        // First 1-RTT ACK arrives delayed by max_ack_delay (25ms): total 29ms.
+        rtt.update(Duration::from_millis(25), Duration::from_millis(29));
+        assert_eq!(rtt.get(), Duration::from_millis(4));
+        assert_eq!(rtt.min(), Duration::from_millis(4));
+
+        // Subsequent single-packet keep-alives also delayed by 25ms must not inflate smoothed RTT.
+        for _ in 0..10 {
+            rtt.update(Duration::from_millis(25), Duration::from_millis(29));
+        }
+        assert_eq!(rtt.get(), Duration::from_millis(4));
+        assert_eq!(rtt.min(), Duration::from_millis(4));
+    }
+
+    #[test]
+    fn test_path_responses_multi_local_ip() {
+        let remote: SocketAddr = "192.168.20.152:60754".parse().unwrap();
+        let path_a = FourTuple {
+            remote,
+            local_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 126))),
+        };
+        let path_b = FourTuple {
+            remote,
+            local_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 20, 10))),
+        };
+
+        let mut responses = PathResponses::default();
+        responses.push(1, 0xaaaa, path_a);
+        responses.push(2, 0xbbbb, path_b);
+
+        assert_eq!(responses.pop_off_path(path_a), Some((0xbbbb, path_b)));
+        assert_eq!(responses.pop_on_path(path_a), Some(0xaaaa));
     }
 }
