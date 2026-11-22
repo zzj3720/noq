@@ -575,6 +575,9 @@ pub struct Bbr3 {
     /// Used when computing `offload_budget` per
     /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.8.2>.
     max_ack_delay: Duration,
+    /// Whether at least one real RTT sample has been observed to replace the initial 1ms pacing
+    /// rate estimate.
+    has_seen_rtt: bool,
 }
 
 impl Bbr3 {
@@ -702,6 +705,7 @@ impl Bbr3 {
             // when the connection supplies peer ACK-frequency parameters.
             ack_eliciting_threshold: 1,
             max_ack_delay: Duration::from_millis(25),
+            has_seen_rtt: false,
         }
     }
 
@@ -1663,6 +1667,13 @@ impl Bbr3 {
         _app_limited: bool,
         rtt: &RttEstimator,
     ) {
+        if !self.has_seen_rtt && rtt.has_sample() {
+            self.has_seen_rtt = true;
+            let rtt_secs = rtt.get().max(Duration::from_millis(1)).as_secs_f64();
+            let nominal_bandwidth = self.initial_cwnd as f64 / rtt_secs;
+            self.pacing_rate = self.startup_pacing_gain * nominal_bandwidth;
+            self.set_send_quantum();
+        }
         self.check_recovery_done(sent);
         self.delivered += bytes;
         self.delivered_time = Some(now);
@@ -1741,7 +1752,8 @@ impl Bbr3 {
         if largest_packet_num_acked.is_some() {
             if self.app_limited != 0 && self.delivered > self.app_limited {
                 self.app_limited = 0;
-            } else if app_limited {
+            }
+            if app_limited {
                 self.app_limited = Ord::max(self.delivered + self.inflight, 1);
             }
             let round_count = self.round_count;
@@ -6989,6 +7001,217 @@ mod test {
             final_err < 0.10,
             "max_bw after subsequent probing ({max_bw_final}) should still be within 10% of the \
              simulated {BW} (rel err {final_err})"
+        );
+    }
+
+    #[test]
+    fn idle_keepalive_does_not_collapse_max_bw() {
+        const MSS: u64 = 1200;
+        const BW: f64 = 12_500_000.0;
+        const RTT_NS: u64 = 50_000_000;
+
+        let mut sim = Sim::new(Bbr3Config::default(), MSS, BW, RTT_NS);
+        sim.run(
+            1_000_000,
+            |_| ControlFlow::Continue(()),
+            |bbr, _now_ns, _inflight, _pn| {
+                if matches!(bbr.state, BbrState::ProbeBw(_)) && bbr.max_bw >= 10_000_000.0 {
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            },
+        );
+
+        // Drain any remaining packets in flight while transitioning to idle/app-limited.
+        while let Some(p) = sim.flight.pop_front() {
+            sim.now_ns = sim.now_ns.max(p.ack_ns);
+            sim.inflight -= sim.mss;
+            let now_at = sim.at(sim.now_ns);
+            let send_at = sim.at(p.send_ns);
+            sim.rtt_est.update(
+                Duration::ZERO,
+                Duration::from_nanos(sim.now_ns - p.send_ns),
+            );
+            sim.bbr.on_ack(
+                now_at,
+                send_at,
+                sim.mss,
+                p.pn,
+                SpaceKind::Data,
+                true,
+                &sim.rtt_est,
+            );
+            sim.bbr
+                .on_end_acks(now_at, sim.inflight, true, Some(p.pn), SpaceKind::Data);
+        }
+
+        let steady_max_bw = sim.bbr.max_bw;
+        assert!(
+            steady_max_bw >= 10_000_000.0,
+            "expected steady max_bw >= 10 MB/s, got {steady_max_bw}"
+        );
+
+        // Simulate 300 seconds of 1/s 50-byte keepalives with 50ms RTT, always app-limited.
+        let mut now_ns = sim.now_ns;
+        for pn in (sim.pn..).take(300) {
+            now_ns += 1_000_000_000;
+            let send_ns = now_ns;
+            let ack_ns = send_ns + RTT_NS;
+            let send_at = sim.at(send_ns);
+            let ack_at = sim.at(ack_ns);
+
+            sim.bbr.on_packet_sent(send_at, 50, pn, SpaceKind::Data);
+            sim.rtt_est
+                .update(Duration::ZERO, Duration::from_nanos(RTT_NS));
+            sim.bbr
+                .on_ack(ack_at, send_at, 50, pn, SpaceKind::Data, true, &sim.rtt_est);
+            sim.bbr
+                .on_end_acks(ack_at, 0, true, Some(pn), SpaceKind::Data);
+
+            now_ns = ack_ns;
+        }
+
+        assert!(
+            sim.bbr.max_bw >= steady_max_bw * 0.8,
+            "max_bw collapsed after 300s of idle keepalives: before={steady_max_bw}, after={}",
+            sim.bbr.max_bw
+        );
+        assert!(
+            sim.bbr.pacing_rate >= steady_max_bw * 0.7,
+            "pacing_rate collapsed after 300s of idle keepalives: steady_max_bw={steady_max_bw}, pacing_rate={}",
+            sim.bbr.pacing_rate
+        );
+    }
+
+    #[test]
+    fn app_limited_flow_control_preserves_max_bw() {
+        const MSS: u64 = 1200;
+        const BW: f64 = 12_500_000.0;
+        const RTT_NS: u64 = 50_000_000;
+
+        let mut sim = Sim::new(Bbr3Config::default(), MSS, BW, RTT_NS);
+        sim.run(
+            1_000_000,
+            |_| ControlFlow::Continue(()),
+            |bbr, _now_ns, _inflight, _pn| {
+                if matches!(bbr.state, BbrState::ProbeBw(_)) && bbr.max_bw >= 10_000_000.0 {
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            },
+        );
+
+        while let Some(p) = sim.flight.pop_front() {
+            sim.now_ns = sim.now_ns.max(p.ack_ns);
+            sim.inflight -= sim.mss;
+            let now_at = sim.at(sim.now_ns);
+            let send_at = sim.at(p.send_ns);
+            sim.rtt_est.update(
+                Duration::ZERO,
+                Duration::from_nanos(sim.now_ns - p.send_ns),
+            );
+            sim.bbr.on_ack(
+                now_at,
+                send_at,
+                sim.mss,
+                p.pn,
+                SpaceKind::Data,
+                true,
+                &sim.rtt_est,
+            );
+            sim.bbr
+                .on_end_acks(now_at, sim.inflight, true, Some(p.pn), SpaceKind::Data);
+        }
+
+        let steady_max_bw = sim.bbr.max_bw;
+        // Ensure an existing app_limited marker equal to current delivered bytes.
+        assert_eq!(sim.bbr.app_limited, sim.bbr.delivered);
+
+        // Send and ACK one packet so `delivered` crosses the old `app_limited` boundary while
+        // `on_end_acks` still reports `app_limited = true`.
+        let mut pn = sim.pn;
+        let send1_ns = sim.now_ns + 1_000_000_000;
+        let ack1_ns = send1_ns + RTT_NS;
+        sim.bbr
+            .on_packet_sent(sim.at(send1_ns), 50, pn, SpaceKind::Data);
+        sim.rtt_est
+            .update(Duration::ZERO, Duration::from_nanos(RTT_NS));
+        sim.bbr.on_ack(
+            sim.at(ack1_ns),
+            sim.at(send1_ns),
+            50,
+            pn,
+            SpaceKind::Data,
+            true,
+            &sim.rtt_est,
+        );
+        sim.bbr
+            .on_end_acks(sim.at(ack1_ns), 0, true, Some(pn), SpaceKind::Data);
+        assert!(
+            sim.bbr.app_limited > 0,
+            "app_limited must be renewed when delivered crosses old boundary while still app_limited"
+        );
+
+        // Next low-rate packet must be marked `is_app_limited = true` and must not lower `max_bw`.
+        pn += 1;
+        let send2_ns = ack1_ns + 1_000_000_000;
+        let ack2_ns = send2_ns + RTT_NS;
+        sim.bbr
+            .on_packet_sent(sim.at(send2_ns), 50, pn, SpaceKind::Data);
+        sim.rtt_est
+            .update(Duration::ZERO, Duration::from_nanos(RTT_NS));
+        sim.bbr.on_ack(
+            sim.at(ack2_ns),
+            sim.at(send2_ns),
+            50,
+            pn,
+            SpaceKind::Data,
+            true,
+            &sim.rtt_est,
+        );
+        sim.bbr
+            .on_end_acks(sim.at(ack2_ns), 0, true, Some(pn), SpaceKind::Data);
+
+        let rs = sim.bbr.rs.expect("expected rate sample after ack");
+        assert!(
+            rs.is_app_limited,
+            "low-rate sample after renewed app_limited boundary must be flagged is_app_limited"
+        );
+        assert_eq!(
+            sim.bbr.max_bw, steady_max_bw,
+            "app-limited low-rate sample must not lower max_bw"
+        );
+    }
+
+    #[test]
+    fn initial_pacing_rate_updates_on_first_rtt_sample() {
+        let config = Arc::new(Bbr3Config::default());
+        let initial_window = config.initial_window;
+        let mut bbr = Bbr3::new(config, 1200);
+        let mut rtt = RttEstimator::new(Duration::from_millis(333));
+
+        let initial_fake_rate = STARTUP_PACING_GAIN * (initial_window as f64 / 0.001);
+        assert!(
+            (bbr.pacing_rate - initial_fake_rate).abs() < 1.0,
+            "expected initial 1ms-based pacing_rate ~{initial_fake_rate}, got {}",
+            bbr.pacing_rate
+        );
+
+        let t0 = Instant::now();
+        let sample_rtt = Duration::from_millis(50);
+        let t1 = t0 + sample_rtt;
+
+        bbr.on_packet_sent(t0, 1200, 0, SpaceKind::Data);
+        rtt.update(Duration::ZERO, sample_rtt);
+        bbr.on_ack(t1, t0, 1200, 0, SpaceKind::Data, false, &rtt);
+        bbr.on_end_acks(t1, 0, false, Some(0), SpaceKind::Data);
+
+        let expected_rate = STARTUP_PACING_GAIN * (initial_window as f64 / sample_rtt.as_secs_f64());
+        let rel_err = (bbr.pacing_rate - expected_rate).abs() / expected_rate;
+        assert!(
+            rel_err < 0.01,
+            "expected pacing_rate to update to ~{expected_rate} on first 50ms RTT sample, got {} (rel err {rel_err})",
+            bbr.pacing_rate
         );
     }
 }
