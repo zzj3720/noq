@@ -578,6 +578,11 @@ pub struct Bbr3 {
     /// Whether at least one real RTT sample has been observed to replace the initial 1ms pacing
     /// rate estimate.
     has_seen_rtt: bool,
+    /// Maximum tolerated per-round-trip packet loss rate before treating inflight as too high.
+    loss_thresh: f64,
+    /// When true, only adapt lower bounds (`bw_shortterm`/`inflight_shortterm`) on loss rounds
+    /// whose loss rate exceeds `loss_thresh`.
+    gate_lower_bounds_on_loss_thresh: bool,
 }
 
 impl Bbr3 {
@@ -706,6 +711,10 @@ impl Bbr3 {
             ack_eliciting_threshold: 1,
             max_ack_delay: Duration::from_millis(25),
             has_seen_rtt: false,
+            loss_thresh: config
+                .loss_thresh
+                .map_or(LOSS_THRESH, |v| v.clamp(0.001, 0.99)),
+            gate_lower_bounds_on_loss_thresh: config.gate_lower_bounds_on_loss_thresh,
         }
     }
 
@@ -788,7 +797,9 @@ impl Bbr3 {
             | BbrState::ProbeBw(ProbeBwSubstate::Up)
             | BbrState::Startup => {}
             _ => {
-                if self.loss_in_round {
+                if self.loss_in_round
+                    && (!self.gate_lower_bounds_on_loss_thresh || self.is_inflight_too_high())
+                {
                     self.init_lower_bounds();
                     self.loss_lower_bounds();
                 }
@@ -1541,7 +1552,7 @@ impl Bbr3 {
     /// equivalent to IsInflightTooHigh <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.2-1>
     fn is_inflight_too_high(&self) -> bool {
         if let Some(rate_sample) = self.rs {
-            return rate_sample.lost as f64 > rate_sample.tx_in_flight as f64 * LOSS_THRESH;
+            return rate_sample.lost as f64 > rate_sample.tx_in_flight as f64 * self.loss_thresh;
         }
         false
     }
@@ -1554,7 +1565,7 @@ impl Bbr3 {
         };
         let inflight_prev = rate_sample.tx_in_flight.saturating_sub(packet_size) as f64;
         let lost_prev = rate_sample.lost.saturating_sub(packet_size) as f64;
-        let lost_prefix = (LOSS_THRESH * inflight_prev - lost_prev) / (1.0 - LOSS_THRESH);
+        let lost_prefix = (self.loss_thresh * inflight_prev - lost_prev) / (1.0 - self.loss_thresh);
         (inflight_prev + lost_prefix) as u64
     }
 
@@ -2022,6 +2033,8 @@ pub struct Bbr3Config {
     drain_pacing_gain: Option<f64>,
     pacing_margin_percent: Option<f64>,
     default_cwnd_gain: Option<f64>,
+    loss_thresh: Option<f64>,
+    gate_lower_bounds_on_loss_thresh: bool,
 }
 
 impl Bbr3Config {
@@ -2030,6 +2043,21 @@ impl Bbr3Config {
     /// Recommended value: `min(10 * max_datagram_size, max(2 * max_datagram_size, 14720))`
     pub fn initial_window(&mut self, value: u64) -> &mut Self {
         self.initial_window = value;
+        self
+    }
+
+    /// Maximum tolerated per-round-trip packet loss rate before BBR3 treats inflight as too high
+    /// (`BBR.LossThresh`, default `0.02`). Values are clamped to `[0.001, 0.99]`.
+    pub fn loss_thresh(&mut self, value: f64) -> &mut Self {
+        self.loss_thresh = Some(value);
+        self
+    }
+
+    /// When enabled, only adapt short-term lower bounds (`bw_shortterm` / `inflight_shortterm`) on
+    /// loss rounds whose loss rate exceeds `loss_thresh`, rather than reducing on any packet loss.
+    /// Defaults to `false` (standard BBRv3 behavior).
+    pub fn gate_lower_bounds_on_loss_thresh(&mut self, enabled: bool) -> &mut Self {
+        self.gate_lower_bounds_on_loss_thresh = enabled;
         self
     }
 }
@@ -2050,6 +2078,8 @@ impl Default for Bbr3Config {
             drain_pacing_gain: None,
             pacing_margin_percent: None,
             default_cwnd_gain: None,
+            loss_thresh: None,
+            gate_lower_bounds_on_loss_thresh: false,
         }
     }
 }
@@ -2231,6 +2261,8 @@ mod test {
             drain_pacing_gain: None,
             pacing_margin_percent: None,
             default_cwnd_gain: None,
+            loss_thresh: None,
+            gate_lower_bounds_on_loss_thresh: false,
         };
         let mut bbr3 = Bbr3::new(Arc::new(config), 2500);
         bbr3.pick_probe_wait();
@@ -7212,6 +7244,85 @@ mod test {
             rel_err < 0.01,
             "expected pacing_rate to update to ~{expected_rate} on first 50ms RTT sample, got {} (rel err {rel_err})",
             bbr.pacing_rate
+        );
+    }
+
+    #[test]
+    fn loss_thresh_config_prevents_high_loss_collapse() {
+        let mut tuned = Bbr3Config::default();
+        tuned
+            .initial_window(256 * 1024)
+            .loss_thresh(0.30)
+            .gate_lower_bounds_on_loss_thresh(true);
+        let tuned_res = crate::tests::util::run_bbr3_pair_transfer(
+            tuned,
+            80,
+            10_000_000,
+            16 * 1024 * 1024,
+            0.01,
+            0.15,
+            4 * 1024 * 1024,
+        );
+        assert!(
+            tuned_res.bps1 >= 2.0 * 1024.0 * 1024.0,
+            "expected tuned BBR3 #1 throughput >= 2 MB/s under 15% loss, got {:.1} KB/s",
+            tuned_res.bps1 / 1024.0
+        );
+        assert!(
+            tuned_res.bps2 >= 2.0 * 1024.0 * 1024.0,
+            "expected tuned BBR3 #2 throughput >= 2 MB/s under 15% loss, got {:.1} KB/s",
+            tuned_res.bps2 / 1024.0
+        );
+        assert!(
+            tuned_res.final_cwnd > tuned_res.min_pipe_cwnd * 4,
+            "expected tuned BBR3 cwnd ({}) to stay well above min_pipe_cwnd ({})",
+            tuned_res.final_cwnd,
+            tuned_res.min_pipe_cwnd
+        );
+
+        let mut stock = Bbr3Config::default();
+        stock.initial_window(256 * 1024);
+        let stock_res = crate::tests::util::run_bbr3_pair_transfer(
+            stock,
+            80,
+            10_000_000,
+            16 * 1024 * 1024,
+            0.01,
+            0.15,
+            4 * 1024 * 1024,
+        );
+        assert!(
+            stock_res.bps2 < 512.0 * 1024.0,
+            "expected default Bbr3Config to preserve standard 2% loss protection under 15% loss, got {:.1} KB/s",
+            stock_res.bps2 / 1024.0
+        );
+    }
+
+    #[test]
+    fn loss_thresh_config_respects_shallow_buffer_congestion() {
+        let mut tuned = Bbr3Config::default();
+        tuned
+            .initial_window(256 * 1024)
+            .loss_thresh(0.30)
+            .gate_lower_bounds_on_loss_thresh(true);
+        let res = crate::tests::util::run_bbr3_pair_transfer(
+            tuned,
+            80,
+            2_000_000,
+            64 * 1024,
+            0.0,
+            0.0,
+            4 * 1024 * 1024,
+        );
+        assert!(
+            res.retx2_pct < 2.0,
+            "expected steady-state #2 retransmission rate < 2% on shallow 64 KB FIFO, got {:.2}%",
+            res.retx2_pct
+        );
+        assert!(
+            res.bps2 >= 1.5 * 1024.0 * 1024.0,
+            "expected steady-state #2 throughput >= 1.5 MB/s on 2 MB/s shallow FIFO, got {:.1} KB/s",
+            res.bps2 / 1024.0
         );
     }
 }

@@ -11,7 +11,7 @@ use std::{
 
 use assert_matches::assert_matches;
 use bytes::{Bytes, BytesMut};
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{Rng, RngExt, SeedableRng, rngs::StdRng};
 use rustls::{
     KeyLogFile,
     client::WebPkiServerVerifier,
@@ -1715,6 +1715,12 @@ impl Routing {
             Self::BwLimited(bw_limited_routing) => bw_limited_routing.set_latency(latency),
         }
     }
+
+    pub(super) fn set_asymmetric_loss(&mut self, c2s_loss: f64, s2c_loss: f64) {
+        if let Self::BwLimited(bw_limited_routing) = self {
+            bw_limited_routing.set_asymmetric_loss(c2s_loss, s2c_loss);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2288,6 +2294,9 @@ pub(super) struct BwLimitedRouting {
     limiter_server_to_client: Limiter,
 
     latency: Duration,
+    c2s_loss_rate: f64,
+    s2c_loss_rate: f64,
+    rng: Box<StdRng>,
 }
 
 /// Tunable parameters for [`BwLimitedRouting`].
@@ -2327,11 +2336,19 @@ impl BwLimitedRouting {
             limiter_client_to_server: Limiter::new(bytes_per_second, buffer_size, now),
             limiter_server_to_client: Limiter::new(bytes_per_second, buffer_size, now),
             latency,
+            c2s_loss_rate: 0.0,
+            s2c_loss_rate: 0.0,
+            rng: Box::new(StdRng::from_seed([42u8; 32])),
         }
     }
 
     pub(super) fn set_latency(&mut self, latency: Duration) {
         self.latency = latency;
+    }
+
+    pub(super) fn set_asymmetric_loss(&mut self, c2s_loss: f64, s2c_loss: f64) {
+        self.c2s_loss_rate = c2s_loss;
+        self.s2c_loss_rate = s2c_loss;
     }
 
     fn public_server_addr(&self) -> SocketAddr {
@@ -2340,6 +2357,9 @@ impl BwLimitedRouting {
 
     fn route_client_to_server(&mut self, transmit: &Transmit, now: Instant) -> RoutingDecision {
         if transmit.destination == self.server_addr {
+            if self.c2s_loss_rate > 0.0 && self.rng.random::<f64>() < self.c2s_loss_rate {
+                return RoutingDecision::Drop;
+            }
             if let Some((sent_time, congestion_experienced)) = self
                 .limiter_client_to_server
                 .time_of_send(now, transmit.size)
@@ -2361,6 +2381,9 @@ impl BwLimitedRouting {
 
     fn route_server_to_client(&mut self, transmit: &Transmit, now: Instant) -> RoutingDecision {
         if transmit.destination == self.client_addr {
+            if self.s2c_loss_rate > 0.0 && self.rng.random::<f64>() < self.s2c_loss_rate {
+                return RoutingDecision::Drop;
+            }
             if let Some((sent_time, congestion_experienced)) = self
                 .limiter_server_to_client
                 .time_of_send(now, transmit.size)
@@ -2412,5 +2435,264 @@ impl Limiter {
         let experienced_congestion = self.finished_sending_at > now + self.max_queue / 2;
 
         Some((self.finished_sending_at, experienced_congestion))
+    }
+}
+
+pub(crate) struct Bbr3PairTransferResult {
+    pub(crate) bps1: f64,
+    pub(crate) bps2: f64,
+    pub(crate) retx2_pct: f64,
+    pub(crate) final_cwnd: u64,
+    pub(crate) min_pipe_cwnd: u64,
+}
+
+/// Drives a real `Pair` connection (10s small keepalives/RPCs -> transfer #1 -> 5s idle ->
+/// transfer #2) using `Bbr3Config` over a bandwidth-limited, optionally lossy link.
+pub(crate) fn run_bbr3_pair_transfer(
+    config: crate::congestion::Bbr3Config,
+    rtt_ms: u64,
+    bps_limit: u64,
+    buffer_size: u32,
+    c2s_loss: f64,
+    s2c_loss: f64,
+    transfer_bytes: usize,
+) -> Bbr3PairTransferResult {
+    use crate::WriteError;
+
+    let mut transport = TransportConfig::default();
+    transport.congestion_controller_factory(Arc::new(config));
+    transport.stream_receive_window(VarInt::from_u32(4 * 1024 * 1024));
+    transport.keep_alive_interval(Some(Duration::from_secs(1)));
+    transport.max_idle_timeout(Some(VarInt::from_u32(10 * 60_000).into()));
+
+    let routes = BwLimitedRouting::new(
+        Pair::CLIENT_ADDR,
+        Pair::SERVER_ADDR,
+        Instant::now(),
+        BwLimitConfig {
+            bytes_per_second: bps_limit,
+            buffer_size,
+            latency: Duration::from_millis(rtt_ms / 2),
+        },
+    );
+    let (mut pair, client_cfg) = ConnPair::builder()
+        .with_transport_cfg(transport)
+        .with_routes(routes)
+        .build_pair();
+    let client_ch = pair.begin_connect(client_cfg);
+    let mut server_ch = None;
+    for _ in 0..10_000 {
+        pair.drive_client();
+        pair.drive_server();
+        if server_ch.is_none()
+            && let Some(Ok(ch)) = pair.server.accepted.take()
+        {
+            server_ch = Some(ch);
+        }
+        if let Some(sch) = server_ch {
+            let c_done = !pair
+                .client
+                .connections
+                .get(&client_ch)
+                .unwrap()
+                .is_handshaking();
+            let s_done = !pair.server.connections.get(&sch).unwrap().is_handshaking();
+            if c_done && s_done {
+                break;
+            }
+        }
+        assert!(pair.advance_time(), "handshake stalled");
+    }
+    let server_ch = server_ch.expect("server never accepted");
+    while pair
+        .client
+        .connections
+        .get_mut(&client_ch)
+        .unwrap()
+        .poll()
+        .is_some()
+    {}
+    while pair
+        .server
+        .connections
+        .get_mut(&server_ch)
+        .unwrap()
+        .poll()
+        .is_some()
+    {}
+    pair.routes.set_asymmetric_loss(c2s_loss, s2c_loss);
+
+    let mut open_recv: Vec<StreamId> = Vec::new();
+    let mut received_map: HashMap<StreamId, usize> = HashMap::new();
+
+    let drain = |pair: &mut Pair,
+                 open_recv: &mut Vec<StreamId>,
+                 received_map: &mut HashMap<StreamId, usize>| {
+        let conn = pair.client.connections.get_mut(&client_ch).unwrap();
+        while conn.poll().is_some() {}
+        while let Some(sid) = conn.streams().accept(Dir::Uni) {
+            open_recv.push(sid);
+        }
+        for &sid in open_recv.iter() {
+            let mut rs = conn.recv_stream(sid);
+            if let Ok(mut chunks) = rs.read(true) {
+                while let Ok(Some(chunk)) = chunks.next(65536) {
+                    *received_map.entry(sid).or_insert(0) += chunk.bytes.len();
+                }
+                let _ = chunks.finalize();
+            }
+        }
+    };
+
+    let run_until = |pair: &mut Pair,
+                     target: Instant,
+                     open_recv: &mut Vec<StreamId>,
+                     received_map: &mut HashMap<StreamId, usize>| {
+        for _ in 0..200_000 {
+            pair.drive_client();
+            pair.drive_server();
+            drain(pair, open_recv, received_map);
+            while pair
+                .server
+                .connections
+                .get_mut(&server_ch)
+                .unwrap()
+                .poll()
+                .is_some()
+            {}
+            let next = match (pair.client.next_wakeup(), pair.server.next_wakeup()) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            match next {
+                Some(t) if t <= target => pair.time = pair.time.max(t),
+                _ => {
+                    pair.time = pair.time.max(target);
+                    return;
+                }
+            }
+        }
+        panic!("run_until exceeded iteration cap");
+    };
+
+    let send_small = |pair: &mut Pair, size: usize| {
+        let conn = pair.server.connections.get_mut(&server_ch).unwrap();
+        let sid = conn.streams().open(Dir::Uni).expect("open small uni");
+        let data = vec![0x55u8; size];
+        let mut ss = conn.send_stream(sid);
+        let mut off = 0;
+        while off < data.len() {
+            match ss.write(&data[off..]) {
+                Ok(w) => off += w,
+                Err(WriteError::Blocked) => break,
+                Err(e) => panic!("small write err: {e:?}"),
+            }
+        }
+        let _ = ss.finish();
+    };
+
+    let send_and_measure = |pair: &mut Pair,
+                            open_recv: &mut Vec<StreamId>,
+                            received_map: &mut HashMap<StreamId, usize>|
+     -> f64 {
+        let start = pair.time;
+        let sid = pair
+            .server
+            .connections
+            .get_mut(&server_ch)
+            .unwrap()
+            .streams()
+            .open(Dir::Uni)
+            .expect("open uni stream");
+        let mut remaining = transfer_bytes;
+        let buf = vec![0xABu8; 65536];
+        for _ in 0..5_000_000 {
+            if remaining > 0 {
+                let conn = pair.server.connections.get_mut(&server_ch).unwrap();
+                let mut ss = conn.send_stream(sid);
+                while remaining > 0 {
+                    let n = remaining.min(buf.len());
+                    match ss.write(&buf[..n]) {
+                        Ok(w) => remaining -= w,
+                        Err(WriteError::Blocked) => break,
+                        Err(e) => panic!("write error: {e:?}"),
+                    }
+                }
+                if remaining == 0 {
+                    ss.finish().expect("finish stream");
+                }
+            }
+            pair.drive_server();
+            pair.drive_client();
+            drain(pair, open_recv, received_map);
+            while pair
+                .server
+                .connections
+                .get_mut(&server_ch)
+                .unwrap()
+                .poll()
+                .is_some()
+            {}
+            if received_map.get(&sid).copied().unwrap_or(0) >= transfer_bytes {
+                let elapsed = pair.time.saturating_duration_since(start);
+                return transfer_bytes as f64 / elapsed.as_secs_f64().max(1e-9);
+            }
+            assert!(pair.advance_time(), "transfer stalled");
+        }
+        panic!("transfer exceeded iteration cap");
+    };
+
+    for sec in 1..=10 {
+        send_small(&mut pair, 100);
+        if sec % 2 == 0 {
+            send_small(&mut pair, 10 * 1024);
+        }
+        let target = pair.time + Duration::from_secs(1);
+        run_until(&mut pair, target, &mut open_recv, &mut received_map);
+    }
+
+    let bps1 = send_and_measure(&mut pair, &mut open_recv, &mut received_map);
+    let target = pair.time + Duration::from_secs(5);
+    run_until(&mut pair, target, &mut open_recv, &mut received_map);
+
+    let ps_before = pair
+        .server
+        .connections
+        .get_mut(&server_ch)
+        .unwrap()
+        .path_stats(PathId::ZERO)
+        .unwrap();
+    let bps2 = send_and_measure(&mut pair, &mut open_recv, &mut received_map);
+    let ps_after = pair
+        .server
+        .connections
+        .get_mut(&server_ch)
+        .unwrap()
+        .path_stats(PathId::ZERO)
+        .unwrap();
+
+    let tx2 = ps_after
+        .udp_tx
+        .datagrams
+        .saturating_sub(ps_before.udp_tx.datagrams);
+    let lost2 = ps_after
+        .lost_packets
+        .saturating_sub(ps_before.lost_packets);
+    let retx2_pct = if tx2 > 0 {
+        100.0 * lost2 as f64 / tx2 as f64
+    } else {
+        0.0
+    };
+
+    let conn = pair.server.connections.get(&server_ch).unwrap();
+    let final_cwnd = conn.congestion_state(PathId::ZERO).unwrap().window();
+    let min_pipe_cwnd = 4 * u64::from(conn.current_mtu());
+
+    Bbr3PairTransferResult {
+        bps1,
+        bps2,
+        retx2_pct,
+        final_cwnd,
+        min_pipe_cwnd,
     }
 }

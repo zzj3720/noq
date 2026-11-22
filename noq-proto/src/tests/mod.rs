@@ -45,7 +45,7 @@ use crate::{
     transport_parameters::TransportParameters,
 };
 
-mod util;
+pub(crate) mod util;
 pub(crate) use util::subscribe;
 use util::{
     CERTIFIED_KEY, ConnPair, DEFAULT_MTU, IncomingConnectionBehavior, Pair, client_config,
