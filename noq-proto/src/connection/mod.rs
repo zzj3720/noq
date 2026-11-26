@@ -3515,7 +3515,6 @@ impl Connection {
         );
     }
 
-    /// Drops the path state, declaring any remaining in-flight packets as lost
     /// Discards `path_id`'s state as its `PathDrained` timer does (tests only).
     #[cfg(test)]
     pub(crate) fn discard_path_now(&mut self, now: Instant, path_id: PathId) {
@@ -3553,6 +3552,7 @@ impl Connection {
         self.crypto_state.spaces[space].keys.is_some()
     }
 
+    /// Drops the path state, declaring any remaining in-flight packets as lost
     fn discard_path(&mut self, path_id: PathId, now: Instant) {
         trace!(%path_id, "dropping path state");
         let path = self.path_data(path_id);
