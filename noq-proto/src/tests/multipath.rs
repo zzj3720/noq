@@ -16,7 +16,7 @@ use crate::{
 };
 use crate::{
     ClosePathError, Dir, Event, PathAbandonReason, PathEvent, StreamEvent, TransportErrorCode,
-    n0_nat_traversal,
+    connection::SpaceKind, n0_nat_traversal,
 };
 
 use super::util::{
@@ -2626,5 +2626,42 @@ fn pending_idle_last_open_path_revived_by_inbound_packet_stays_open() -> TestRes
     assert!(established_1);
     assert!(pair.path_status(Client, PathId::ZERO).is_ok());
 
+    Ok(())
+}
+
+/// Path 0 abandoned by the peer and discarded before this side's handshake is confirmed: the
+/// HANDSHAKE_DONE that comes after drops the handshake keys without path 0 (n0-computer/noq#904:
+/// `discard_space` expected path 0 there, panicked, and the poisoned connection mutex took the
+/// process down).
+#[test]
+fn handshake_keys_dropped_after_path_zero_discarded() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, client_cfg) = ConnPair::builder().enable_multipath().build_pair();
+    let client_ch = pair.begin_connect(client_cfg);
+    // The client's Initial, then the server's flight taken by the client: it has its handshake
+    // keys and multipath, and no HANDSHAKE_DONE yet.
+    pair.drive_client();
+    pair.drive_server();
+    pair.drive_client();
+    let now = pair.time;
+    let conn = pair.client_conn_mut(client_ch);
+    assert!(conn.is_multipath_negotiated());
+    assert!(conn.has_keys(SpaceKind::Handshake));
+
+    // The peer abandons path 0 and it drains away before HANDSHAKE_DONE arrives.
+    conn.close_path_inner(
+        now,
+        PathId::ZERO,
+        PathAbandonReason::RemoteAbandoned {
+            error_code: 0u8.into(),
+        },
+    )?;
+    conn.discard_path_now(now, PathId::ZERO);
+    assert!(!conn.paths().contains(&PathId::ZERO));
+    // A late ACK of its Handshake packets is ignored as one on a discarded path.
+    conn.ack_first_packet_now(now, SpaceKind::Handshake)?;
+
+    conn.discard_space_now(now, SpaceKind::Handshake);
+    assert!(!conn.has_keys(SpaceKind::Handshake));
     Ok(())
 }
