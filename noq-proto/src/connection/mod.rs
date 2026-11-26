@@ -3032,7 +3032,10 @@ impl Connection {
         received_path: PathId,
         ack: frame::Ack,
     ) -> Result<(), TransportError> {
-        if !self.spaces[space].number_spaces.contains_key(&path) {
+        // (A discarded path 0 keeps its Initial/Handshake number spaces until those are
+        // discarded: an ACK there arriving late is ignored as one on a discarded path.)
+        if !self.spaces[space].number_spaces.contains_key(&path) || !self.paths.contains_key(&path)
+        {
             if self.abandoned_paths.contains(&path) {
                 // See also
                 // https://www.ietf.org/archive/id/draft-ietf-quic-multipath-21.html#section-3.4.3-3
@@ -3513,6 +3516,43 @@ impl Connection {
     }
 
     /// Drops the path state, declaring any remaining in-flight packets as lost
+    /// Discards `path_id`'s state as its `PathDrained` timer does (tests only).
+    #[cfg(test)]
+    pub(crate) fn discard_path_now(&mut self, now: Instant, path_id: PathId) {
+        self.timers.stop_per_path(path_id, self.qlog.with_time(now));
+        self.discard_path(path_id, now);
+    }
+
+    /// Discards the keys of `space` as handshake progress does (tests only).
+    #[cfg(test)]
+    pub(crate) fn discard_space_now(&mut self, now: Instant, space: SpaceKind) {
+        self.discard_space(now, space);
+    }
+
+    /// Takes the peer's ACK of packet 0 in `space` on path 0, as a frame of it would (tests only).
+    #[cfg(test)]
+    pub(crate) fn ack_first_packet_now(
+        &mut self,
+        now: Instant,
+        space: SpaceKind,
+    ) -> Result<(), TransportError> {
+        let mut ranges = crate::range_set::ArrayRangeSet::new();
+        ranges.insert(0..1);
+        let ack = frame::Ack {
+            largest: 0,
+            delay: 0,
+            ranges,
+            ecn: None,
+        };
+        self.on_ack_received(now, space.into(), PathId::ZERO, ack)
+    }
+
+    /// Whether the keys of `space` are still held (tests only).
+    #[cfg(test)]
+    pub(crate) fn has_keys(&self, space: SpaceKind) -> bool {
+        self.crypto_state.spaces[space].keys.is_some()
+    }
+
     fn discard_path(&mut self, path_id: PathId, now: Instant) {
         trace!(%path_id, "dropping path state");
         let path = self.path_data(path_id);
@@ -4286,10 +4326,13 @@ impl Connection {
         pns.loss_time = None;
         pns.loss_probes = 0;
         let sent_packets = mem::take(&mut pns.sent_packets);
-        let path = self
-            .paths
-            .get_mut(&PathId::ZERO)
-            .expect("PathId::ZERO is alive while Initial/Handshake spaces exist");
+        // Path 0 can be abandoned and discarded before the handshake is confirmed (a replacement
+        // path took over, or the peer sent PATH_ABANDON for it): its congestion state and loss
+        // timer went with it, so only the keys and the sent packets are left to drop.
+        let Some(path) = self.paths.get_mut(&PathId::ZERO) else {
+            trace!("path 0 already discarded; dropped the keys and sent packets only");
+            return;
+        };
         for (_, packet) in sent_packets.into_iter() {
             path.data.remove_in_flight(&packet);
         }
